@@ -1,0 +1,5 @@
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-Zshare-generics=y", # (Nightly) Make the current crate share its generic instantiations
+    "-Zthreads=0",        # (Nightly) Use improved multithreading with the recommended amount of threads.
+]
