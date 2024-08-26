@@ -1,5 +1,7 @@
 use avian2d::{math::*, prelude::*};
-use bevy::{ecs::query::Has, prelude::*};
+use bevy::{ecs::query::Has, prelude::*, window::PrimaryWindow};
+
+use crate::Halt;
 
 pub struct CharacterControllerPlugin;
 
@@ -145,6 +147,10 @@ impl CharacterControllerBundle {
     }
 }
 
+fn not_halted() -> impl Condition<()> {
+    resource_exists::<Halt>.and_then(resource_equals(Halt(false)))
+}
+
 /// Sends [`MovementAction`] events based on keyboard input.
 fn keyboard_input(
     mut movement_event_writer: EventWriter<MovementAction>,
@@ -161,6 +167,7 @@ fn keyboard_input(
     }
 
     if keyboard_input.just_pressed(KeyCode::Space) {
+        println!("SPACE");
         movement_event_writer.send(MovementAction::Jump);
     }
 }
@@ -212,7 +219,9 @@ fn update_grounded(
         // that isn't too steep.
         let is_grounded = hits.iter().any(|hit| {
             if let Some(angle) = max_slope_angle {
-                (rotation * -hit.normal2).angle_between(-gravity.0).abs() <= angle.0
+                let outcome = (rotation * -hit.normal2).angle_between(-gravity.0).abs() <= angle.0;
+                println!("is grounded: {outcome}");
+                outcome
             } else {
                 true
             }
@@ -255,7 +264,9 @@ fn movement(
                     gizmos.arrow_2d(Vec2::ZERO, direction, Color::srgb(1.0, 0.0, 0.0));
                 }
                 MovementAction::Jump => {
+                    println!("JUMP");
                     if is_grounded {
+                        println!("velocity: {}", -gravity.0 * jump_impulse.0);
                         *linear_velocity = LinearVelocity(-gravity.0 * jump_impulse.0);
                     }
                 }
@@ -274,7 +285,6 @@ fn apply_gravity(
         &mut LinearVelocity,
         &mut ShapeCaster,
     )>,
-    mut gizmos: Gizmos,
 ) {
     // Precision is adjusted so that the example works with
     // both the `f32` and `f64` features. Otherwise you don't need this.
@@ -288,33 +298,35 @@ fn apply_gravity(
 
         *current_gravity = CurrentControllerGravity(direction);
         shape_caster.direction = Dir2::new_unchecked(direction);
-        linear_velocity.0 += (direction * gravity.0).xy() * delta_time;
 
-        gizmos.arrow_2d(
-            position,
-            position + linear_velocity.0,
-            Color::srgb(1.0, 0.0, 0.0),
-        );
+        linear_velocity.0 += (direction * gravity.0).xy() * delta_time;
     }
 }
 
 fn move_camera(
     mut camera: Query<(&mut Transform, &Camera2d)>,
-    mut controllers: Query<&CurrentControllerGravity>,
+    mut controllers: Query<(&CurrentControllerGravity, &Position)>,
 ) {
-    for gravity in &mut controllers {
+    for (gravity, position) in &mut controllers {
         let mut camera_transform = camera.get_single_mut().unwrap().0;
-        *camera_transform = camera_transform.with_rotation(
-            Quat::from_rotation_z(-gravity.0.angle_between(Vec2::NEG_Y)).normalize(),
-        );
+        *camera_transform = camera_transform
+            .with_rotation(Quat::from_rotation_z(-gravity.0.angle_between(Vec2::NEG_Y)).normalize())
+            .with_translation(position.0.extend(0.0));
     }
 }
 
 /// Slows down movement in the X direction.
-fn apply_movement_damping(mut query: Query<(&MovementDampingFactor, &mut LinearVelocity)>) {
-    for (damping_factor, mut linear_velocity) in &mut query {
-        // We could use `LinearDamping`, but we don't want to dampen movement along the Y axis
-        linear_velocity.x *= damping_factor.0;
+fn apply_movement_damping(
+    mut query: Query<(
+        &MovementDampingFactor,
+        &mut LinearVelocity,
+        &CurrentControllerGravity,
+    )>,
+) {
+    for (damping_factor, mut linear_velocity, gravity) in &mut query {
+        let tangent = gravity.0.perp();
+        let projection = linear_velocity.project_onto(tangent);
+        linear_velocity.0 -= projection * damping_factor.0;
     }
 }
 
@@ -325,7 +337,7 @@ fn apply_movement_damping(mut query: Query<(&MovementDampingFactor, &mut LinearV
 /// by pushing them along their contact normals by the current penetration depth,
 /// and applying velocity corrections in order to snap to slopes, slide along walls,
 /// and predict collisions using speculative contacts.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn kinematic_controller_collisions(
     collisions: Res<Collisions>,
     bodies: Query<&RigidBody>,
@@ -336,12 +348,19 @@ fn kinematic_controller_collisions(
             &Rotation,
             &mut LinearVelocity,
             Option<&MaxSlopeAngle>,
-            &CurrentControllerGravity,
+            &mut CurrentControllerGravity,
         ),
         (With<RigidBody>, With<CharacterController>),
     >,
     time: Res<Time>,
+    mut halt: ResMut<Halt>,
+    mut gizmos: Gizmos,
 ) {
+    if collisions.iter().count() == 0 {
+        halt.0 = false;
+        println!("no contacts");
+    }
+
     // Iterate through collisions and move the kinematic body to resolve penetration
     for contacts in collisions.iter() {
         // Get the rigid body entities of the colliders (colliders could be children)
@@ -377,27 +396,53 @@ fn kinematic_controller_collisions(
                 continue;
             };
 
+        // gizmos.arrow_2d(
+        //     **position,
+        //     **position + gravity.0,
+        //     Color::srgb(1.0, 0.0, 0.0),
+        // );
+
         // This system only handles collision response for kinematic character controllers.
         if !character_rb.is_kinematic() {
             continue;
         }
 
+        println!("-----------------");
+
         // Iterate through contact manifolds and their contacts.
         // Each contact in a single manifold shares the same contact normal.
         for manifold in contacts.manifolds.iter() {
             let normal = if is_first {
+                println!("chose normal 1");
                 -manifold.global_normal1(rotation)
             } else {
+                println!("chose normal 2");
                 -manifold.global_normal2(rotation)
             };
 
+            println!("normal: {normal}");
+            // gizmos.arrow_2d(
+            //     **position,
+            //     **position + normal * 60.0,
+            //     Color::srgb(1.0, 1.0, 1.0),
+            // );
+
             let mut deepest_penetration: Scalar = Scalar::MIN;
+
+            const PEN_LIMIT: f32 = 3.0;
 
             // Solve each penetrating contact in the manifold.
             for contact in manifold.contacts.iter() {
-                if contact.penetration > 0.0 {
-                    position.0 += normal * contact.penetration;
-                }
+                let mov = if contact.penetration > PEN_LIMIT {
+                    println!("MOVE: pos");
+                    normal * contact.penetration
+                } else {
+                    // -normal * contact.penetration
+                    Vec2::ZERO
+                };
+                println!("move: {mov}");
+                position.0 += mov;
+                println!("penetration: {}", contact.penetration);
                 deepest_penetration = deepest_penetration.max(contact.penetration);
             }
 
@@ -407,80 +452,58 @@ fn kinematic_controller_collisions(
             }
 
             // Determine if the slope is climbable or if it's too steep to walk on.
-            let slope_angle = normal.angle_between(gravity.0);
+            let slope_angle = normal.angle_between(-gravity.0);
             let climbable = max_slope_angle.is_some_and(|angle| slope_angle.abs() <= angle.0);
 
+            println!("deepest penetration: {deepest_penetration}");
+
             if deepest_penetration > 0.0 {
-                // If the slope is climbable, snap the velocity so that the character goes
-                // up and down the surface smoothly.
-                if climbable {
-                    // Points either left or right depending on which side the normal is leaning on.
-                    // (This could be simplified for 2D, but this approach is dimension-agnostic)
-                    let normal_direction_x =
-                        normal.reject_from_normalized(gravity.0).normalize_or_zero();
+                println!("reject from surface");
 
-                    // The movement speed along the direction above.
-                    let linear_velocity_x = linear_velocity.dot(normal_direction_x);
-
-                    // Snap the Y speed based on the speed at which the character is moving
-                    // up or down the slope, and how steep the slope is.
-                    //
-                    // A 2D visualization of the slope, the contact normal, and the velocity components:
-                    //
-                    //             ╱
-                    //     normal ╱
-                    // *         ╱
-                    // │   *    ╱   velocity_x
-                    // │       * - - - - - -
-                    // │           *       | velocity_y
-                    // │               *   |
-                    // *───────────────────*
-
-                    let max_y_speed = -linear_velocity_x * slope_angle.tan();
-                    linear_velocity.y = linear_velocity.y.max(max_y_speed);
-                } else {
-                    // The character is intersecting an unclimbable object, like a wall.
-                    // We want the character to slide along the surface, similarly to
-                    // a collide-and-slide algorithm.
-
-                    // Don't apply an impulse if the character is moving away from the surface.
-                    if linear_velocity.dot(normal) > 0.0 {
-                        continue;
-                    }
-
-                    // Slide along the surface, rejecting the velocity along the contact normal.
-                    let impulse = linear_velocity.reject_from_normalized(normal);
-                    linear_velocity.0 = impulse;
+                if deepest_penetration < 1.0 {
+                    continue;
                 }
+                println!("MOVE: reject");
+                let impulse = linear_velocity.reject_from_normalized(normal);
+                println!("impulse: {}", impulse.length());
+                linear_velocity.0 = impulse;
             } else {
-                // The character is not yet intersecting the other object,
-                // but the narrow phase detected a speculative collision.
-                //
-                // We need to push back the part of the velocity
-                // that would cause penetration within the next frame.
+                if deepest_penetration > -PEN_LIMIT {
+                    continue;
+                }
+                println!("no intersect yet");
 
                 let normal_speed = linear_velocity.dot(normal);
+                println!("normal speed: {normal_speed}");
 
                 // Don't apply an impulse if the character is moving away from the surface.
+                // Otherwise jumping is rather hard ;)
                 if normal_speed > 0.0 {
                     continue;
                 }
 
-                // Compute the impulse to apply.
-                let impulse_magnitude = normal_speed
-                    - (deepest_penetration / time.delta_seconds_f64().adjust_precision());
-                let mut impulse = impulse_magnitude * normal;
+                println!("MOVE: impulse");
 
-                // Apply the impulse differently depending on the slope angle.
-                if climbable {
-                    // Avoid sliding down slopes.
-                    linear_velocity.y -= impulse.y.min(0.0);
-                } else {
-                    // Avoid climbing up walls.
-                    impulse.y = impulse.y.max(0.0);
-                    linear_velocity.0 -= impulse;
-                }
+                let impulse_magnitude = normal_speed
+                    - deepest_penetration / time.delta_seconds_f64().adjust_precision();
+                let impulse = impulse_magnitude * normal;
+
+                println!("impulse: {impulse}");
+
+                // gizmos.arrow_2d(
+                //     **position,
+                //     **position + impulse * 600.0,
+                //     Color::srgb(0.0, 0.0, 0.0),
+                // );
+
+                linear_velocity.0 -= impulse;
             }
         }
     }
+}
+
+#[test]
+fn dot() {
+    dbg!(Vec2::new(0.0, 1.0).dot(Vec2::new(0.5, 1.0)));
+    panic!();
 }

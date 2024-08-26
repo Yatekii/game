@@ -27,7 +27,7 @@ pub fn spawn_player(
         Player {},
         CharacterControllerBundle::new(Collider::circle(0.5), 1500.0).with_movement(
             1250.0,
-            0.92,
+            0.1,
             800.0,
             (70.0 as Scalar).to_radians(),
         ),
